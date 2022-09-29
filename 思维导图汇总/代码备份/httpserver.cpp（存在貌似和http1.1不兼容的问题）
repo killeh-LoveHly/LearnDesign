@@ -1,0 +1,388 @@
+//
+// Created by cqfeng on 2020/1/12.
+//
+#include<stdio.h>
+#include<iostream>
+#include<cstring>
+#include<string>
+#include<cstdlib>
+#include<sys/types.h>
+#include<unistd.h>
+#include <sys/socket.h>
+#include<fstream>
+#include <sys/stat.h>
+#include<arpa/inet.h>
+#include<pthread.h>
+#include<signal.h>
+#include<sys/sem.h>
+#include<sys/wait.h>
+
+
+
+char LOGBUF[1024];
+
+using namespace std;
+
+void save_log(char *buf)
+{
+    FILE *fp = fopen("log1.txt","a+");
+    fputs(buf,fp);
+    fclose(fp);
+}
+
+void handle_child(int sig)
+{
+    pid_t pid;
+    int stat;
+    cout<<"handling child"<<endl;
+    while((pid = waitpid(-1,&stat,WNOHANG))>0)
+    {
+        memset(LOGBUF,0,sizeof(LOGBUF));
+        sprintf(LOGBUF,"%s,%d:child process exit pid: %d\n", __FILE__, __LINE__,pid);
+        save_log(LOGBUF);
+    }
+}
+void addsigchild(int sig)
+{
+    struct sigaction sa;
+    memset(&sa,0,sizeof(struct sigaction));
+
+    sa.sa_handler = handle_child;
+    sa.sa_flags|=SA_RESTART;
+    if(-1 == sigaction(sig,&sa,NULL))
+    {
+        cout<<"adding sigaction failed"<<endl;
+    }
+    cout<<"add sig success"<<endl;
+}
+
+void setodaemon()
+{
+    pid_t pid,sid;
+
+    pid=fork();
+    switch(pid)
+    {
+        case 0:
+            if ((sid = setsid()) < 0)
+            {
+                printf("setsid failed %s\n", strerror(errno));
+                exit (EXIT_FAILURE);
+            }
+            umask(0);
+            close(STDIN_FILENO);
+            close(STDOUT_FILENO);
+            close(STDERR_FILENO);
+            break;
+        default:
+            exit(1);
+    }
+}
+
+int ListenSck_Create(int port)
+{
+    int sock =0;
+    int parm=1;
+    sock =socket(AF_INET, SOCK_STREAM, 0);
+
+    if(sock == -1)
+    {
+        memset(LOGBUF,0,sizeof(LOGBUF));
+        sprintf(LOGBUF,"%s,%d:socker error\n", __FILE__, __LINE__);
+        save_log(LOGBUF);
+        return 0;
+    }
+
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &parm, sizeof(parm)) == -1)
+    {
+        memset(LOGBUF,0,sizeof(LOGBUF));
+        sprintf(LOGBUF,"setsockopt failed \n");
+        save_log(LOGBUF);
+        return 0;
+    }
+
+    struct sockaddr_in sockaddr;
+    memset(&sockaddr,0,sizeof(struct sockaddr_in));
+
+    sockaddr.sin_port = htons(port);
+    sockaddr.sin_family = AF_INET;
+    sockaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if(bind(sock,reinterpret_cast<struct sockaddr *>(&sockaddr),sizeof(struct sockaddr_in)) == -1)
+    {
+        memset(LOGBUF,0,sizeof(LOGBUF));
+        sprintf(LOGBUF,"%s,%d:bind error \n", __FILE__, __LINE__);
+        save_log(LOGBUF);
+        return 0;
+    }
+
+    if(listen(sock,100) == -1) {
+        memset(LOGBUF, 0, sizeof(LOGBUF));
+        sprintf(LOGBUF, "%s,%d:listen failture\n", __FILE__, __LINE__);
+        save_log(LOGBUF);
+        return 0;
+    }
+    cout<<"server start success!!!"<<endl;
+    return sock;
+}
+
+char RECV_BUF[65535];
+#define BUF_SIZE 65535
+
+int recv_html_request(int sock_accepted)
+{
+    int recv_size = 0;
+    int total_size =0;
+
+    while(1) {
+        recv_size = recv(sock_accepted, &RECV_BUF[total_size], BUF_SIZE, 0);
+        if(0 == recv_size) continue;
+        total_size += recv_size;
+
+        for(int i =0;i<total_size;i++)
+        {
+            if(RECV_BUF[i] == '\n')
+            {
+                memset(LOGBUF,0,sizeof(LOGBUF));
+                sprintf(LOGBUF,"%s,%d:recv a raw packet pid: %d\n", __FILE__, __LINE__,getpid());
+                save_log(LOGBUF);
+                return recv_size;
+            }
+        }
+    }
+}
+
+void get_pkt_url(int total_size,char URL[])
+{
+    int i =0;
+    int flag = 0;
+    int start =0,end =0;
+    for(;i<total_size;i++)
+    {
+        if(RECV_BUF[i] == ' ' && flag ==0)
+        {
+            start = i;
+            flag = 1;
+        }
+        else if(RECV_BUF[i]== ' ')
+        {
+            end = i;
+            break;
+        }
+    }
+    memset(URL,'\0',BUF_SIZE);
+    memcpy(URL,reinterpret_cast<const void*>(&RECV_BUF[start+1]),end-start-1);
+
+    memset(LOGBUF,0,sizeof(LOGBUF));
+    sprintf(LOGBUF,"%s,%d:url is %s pid: %d\n", __FILE__, __LINE__,URL,getpid());
+    save_log(LOGBUF);
+}
+
+#define HTTP_RESPONSE_HEAD "HTTP/1.0 200 OK\n\
+Content-Length: %d\n\
+Content-Type: %s\n\
+Connection: Keep-Alive\n\
+Accept-Ranges:bytes\n\n"
+
+const char* getfileType(const char * filename)
+{
+    char sExt[32];
+    const char *p_start=filename;
+    memset(sExt, 0, sizeof(sExt));
+    while(*p_start)
+    {
+        if (*p_start == '.')
+        {
+            p_start++;
+            strncpy(sExt, p_start, sizeof(sExt));
+            break;
+        }
+        p_start++;
+    }
+
+    if (strncmp(sExt, "bmp", 3) == 0)
+        return "image/bmp";
+
+    if (strncmp(sExt, "gif", 3) == 0)
+        return "image/gif";
+
+    if (strncmp(sExt, "ico", 3) == 0)
+        return "image/x-icon";
+
+    if (strncmp(sExt, "jpg", 3) == 0)
+        return "image/jpeg";
+
+    if (strncmp(sExt, "avi", 3) == 0)
+        return "video/avi";
+
+    if (strncmp(sExt, "css", 3) == 0)
+        return "text/css";
+
+    if (strncmp(sExt, "dll", 3) == 0)
+        return "application/x-msdownload";
+
+    if (strncmp(sExt, "exe", 3) == 0)
+        return "application/x-msdownload";
+
+    if (strncmp(sExt, "dtd", 3) == 0)
+        return "text/xml";
+
+    if (strncmp(sExt, "mp3", 3) == 0)
+        return "audio/mp3";
+
+    if (strncmp(sExt, "mpg", 3) == 0)
+        return "video/mpg";
+
+    if (strncmp(sExt, "png", 3) == 0)
+        return "image/png";
+
+    if (strncmp(sExt, "ppt", 3) == 0)
+        return "application/vnd.ms-powerpoint";
+
+    if (strncmp(sExt, "xls", 3) == 0)
+        return "application/vnd.ms-excel";
+
+    if (strncmp(sExt, "doc", 3) == 0)
+        return "application/msword";
+
+    if (strncmp(sExt, "mp4", 3) == 0)
+        return "video/mpeg4";
+
+    if (strncmp(sExt, "ppt", 3) == 0)
+        return "application/x-ppt";
+
+    if (strncmp(sExt, "wma", 3) == 0)
+        return "audio/x-ms-wma";
+
+    if (strncmp(sExt, "wmv", 3) == 0)
+        return "video/x-ms-wmv";
+
+    return "text/html";
+}
+int getRequestfiles(const char *filename,char *content_buf,char **filetype)
+{
+    int content_length =0;
+    FILE *fp=NULL;
+    fp = fopen(filename,"rb");
+    if(NULL == fp)
+    {
+        memset(LOGBUF,0,sizeof(LOGBUF));
+        sprintf(LOGBUF,"file name: %s,%s,%d:open file failture pid: %d\n",filename, __FILE__, __LINE__,getpid());
+        save_log(LOGBUF);
+        return content_length;
+    }
+
+    memset(LOGBUF,0,sizeof(LOGBUF));
+    sprintf(LOGBUF,"file name: %s,%s,%d:ready to send  pid: %d\n",filename, __FILE__, __LINE__,getpid());
+    save_log(LOGBUF);
+    *filetype = const_cast<char *>(getfileType(filename));
+    fseek(fp, 0, SEEK_END);
+    content_length = ftell(fp);
+    rewind(fp);
+
+    fread(content_buf, content_length, 1, fp);
+    fclose(fp);
+
+    return content_length;
+}
+
+void ConstructHttpResponse(char URL[],int accepted_fd)
+{
+    int content_length = 0;
+    char content_buf[BUF_SIZE];
+    char *filetype = NULL;
+    memset(content_buf,'\0',BUF_SIZE);
+    char response_buf[BUF_SIZE];
+
+    if(strcmp(URL,"/") == 0)
+    {
+        content_length = getRequestfiles("index.html",content_buf,&filetype);
+        filetype = const_cast<char *>(getfileType("index.html"));
+    }else
+    {
+        char temppoint[BUF_SIZE]=".";
+        strcat(temppoint,URL);
+        content_length = getRequestfiles(temppoint,content_buf,&filetype);
+        filetype = const_cast<char *>(getfileType(URL));
+    }
+
+    memset(LOGBUF,0,sizeof(LOGBUF));
+    sprintf(LOGBUF,"file type: %s,%s,%d: content_length:%d pid: %d\n",filetype, __FILE__, __LINE__,content_length,getpid());
+    save_log(LOGBUF);
+    sprintf(response_buf,HTTP_RESPONSE_HEAD,content_length,filetype);
+    int head_length = strlen(response_buf);
+    memcpy(&response_buf[head_length],content_buf,content_length);
+
+    if (content_length > 0)
+    {
+        send(accepted_fd, response_buf, head_length+content_length, 0);
+        memset(LOGBUF,0,sizeof(LOGBUF));
+        sprintf(LOGBUF,"file name: %s,%d: Send  response successfully pid: %d\n", __FILE__, __LINE__,getpid());
+        save_log(LOGBUF);
+    }
+    close(accepted_fd);
+}
+
+void Connection_Accept(int sock)
+{
+    //crt thread
+    struct sockaddr_in sockaddr;
+    socklen_t socklen = sizeof(struct sockaddr_in);
+    int sock_accept = 0;
+
+    while(1)
+    {
+        if((sock_accept = accept(sock,reinterpret_cast<struct sockaddr *>(&sockaddr),&socklen)) == -1)
+        {
+            memset(LOGBUF,0,sizeof(LOGBUF));
+            sprintf(LOGBUF,"%s,%d:accept failture \n", __FILE__, __LINE__);
+            save_log(LOGBUF);
+            return;
+        }
+        int ret =0;
+        int total_size = 0;
+        char URL[BUF_SIZE];
+        switch((ret=fork()))
+        {
+            case 0:
+                memset(LOGBUF,0,sizeof(LOGBUF));
+                sprintf(LOGBUF,"%s,%d:create a new child process pid: %d\n", __FILE__, __LINE__,getpid());
+                save_log(LOGBUF);
+
+                total_size = recv_html_request(sock_accept);
+                get_pkt_url(total_size,URL);
+                ConstructHttpResponse(URL,sock_accept);
+                exit(0);
+                break;
+            default:
+            break;
+        }
+    }
+
+}
+
+int main(int argc,char *argv[])
+{
+    if(argc<2||argc>2)
+    {
+        cout<<"usage: ./server port"<<endl;
+        return 0;
+    }
+
+    int sock = 0;
+    string str_port(argv[1]);
+    int port =0;
+    port = stoi(str_port,nullptr);
+
+    cout<<"port is :"<<port<<endl;
+    sock = ListenSck_Create(port);
+    if(sock == 0)
+    {
+        return 0;
+    }
+    setodaemon();
+    addsigchild(SIGCHLD);
+    Connection_Accept(sock);
+
+    return 0;
+}
